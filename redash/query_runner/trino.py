@@ -19,10 +19,25 @@ logger = logging.getLogger(__name__)
 try:
     import trino
     from trino.exceptions import DatabaseError
+    from trino.types import NamedRowTuple
 
     enabled = True
 except ImportError:
     enabled = False
+
+
+def _convert_row_types(value):
+    """Convert NamedRowTuple instances to dicts so ROW fields are serialized with their names."""
+    if isinstance(value, NamedRowTuple):
+        names = value.__annotations__.get("names", [])
+        return {
+            name if name is not None else f"_field{i}": _convert_row_types(v)
+            for i, (name, v) in enumerate(zip(names, value))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_convert_row_types(v) for v in value]
+    return value
+
 
 TRINO_TYPES_MAPPING = {
     "boolean": TYPE_BOOLEAN,
@@ -59,6 +74,7 @@ class Trino(BaseQueryRunner):
                 "username": {"type": "string"},
                 "password": {"type": "string"},
                 "source": {"type": "string", "default": "redash"},
+                "client_tags": {"type": "string", "title": "Client tags (comma separated)"},
                 "catalog": {"type": "string"},
                 "schema": {"type": "string"},
                 "impersonation": {"type": "boolean", "default": False},
@@ -76,6 +92,7 @@ class Trino(BaseQueryRunner):
                 "username",
                 "password",
                 "source",
+                "client_tags",
                 "catalog",
                 "schema",
                 "impersonation",
@@ -83,6 +100,7 @@ class Trino(BaseQueryRunner):
             "required": ["host", "username"],
             "secret": ["password"],
             "extra_options": [
+                "client_tags",
                 "impersonation",
                 "impersonationField",
             ],
@@ -161,6 +179,13 @@ class Trino(BaseQueryRunner):
 
         return default_user
 
+    def _get_client_tags(self):
+        client_tags = self.configuration.get("client_tags")
+        if not client_tags:
+            return None
+        tags = [tag.strip() for tag in client_tags.split(",") if tag.strip()]
+        return tags or None
+
     def run_query(self, query, user):
         if self.configuration.get("password"):
             auth = trino.auth.BasicAuthentication(
@@ -177,6 +202,7 @@ class Trino(BaseQueryRunner):
             catalog=self.configuration.get("catalog", ""),
             schema=self.configuration.get("schema", ""),
             user=self._get_trino_user(user),
+            client_tags=self._get_client_tags(),
             auth=auth,
         )
 
@@ -187,7 +213,8 @@ class Trino(BaseQueryRunner):
             results = cursor.fetchall()
             description = cursor.description
             columns = self.fetch_columns([(c[0], TRINO_TYPES_MAPPING.get(c[1], None)) for c in description])
-            rows = [dict(zip([c["name"] for c in columns], r)) for r in results]
+            column_names = [c["name"] for c in columns]
+            rows = [dict(zip(column_names, [_convert_row_types(v) for v in r])) for r in results]
             data = {"columns": columns, "rows": rows}
             error = None
         except DatabaseError as db:
